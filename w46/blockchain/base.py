@@ -158,31 +158,17 @@ class BaseClient:
             tx_data["gas"] = int(estimated_gas * 1.2)  # 20% buffer
         except Exception as e:
             logger.warning("base.gas_estimate_failed", error=str(e))
-            # Keep the default 100k
+            
+        # Keep the default 100k
+
+        # Remplacer le bloc de signing dans transfer_usdc :
 
         # 5. Sign via KMS
-        # For EVM, KMS needs the raw transaction dict to sign
-        from eth_account import Account
-
-        # Get private key bytes from KMS (briefly in memory)
-        private_bytes = await self._kms._get_private_bytes(from_key_ref)  # TODO: Proper KMS sign_transaction for EVM
-        try:
-            acct = Account.from_key(private_bytes)
-            signed_tx = acct.sign_transaction(tx_data)
-        finally:
-            private_bytes = b"\x00" * len(private_bytes) if private_bytes else b""
+        raw_signed_tx = await self._kms.sign_evm_transaction(from_key_ref, tx_data)
 
         # 6. Send
-        tx_hash = await w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        tx_hash = await w3.eth.send_raw_transaction(raw_signed_tx)
         tx_hash_hex = tx_hash.hex()
-
-        logger.info(
-            "base.tx_sent",
-            tx_hash=tx_hash_hex,
-            from_addr=from_address,
-            to_addr=to_address,
-            amount=str(amount_usdc),
-        )
 
         # 7. Wait for receipt
         receipt = await self._wait_for_receipt(w3, tx_hash, timeout=120)
