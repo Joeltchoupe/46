@@ -86,6 +86,13 @@ class KMSBase(abc.ABC):
         """Check KMS connectivity."""
         ...
 
+    # Dans KMSBase, ajouter :
+
+    @abc.abstractmethod
+    async def sign_evm_transaction(self, key_ref: KeyReference, tx_dict: dict) -> bytes:
+        """Sign an EVM transaction dict. Returns raw signed transaction bytes."""
+        ...
+
 
 # ============================================================
 # Local KMS (Dev/Test Only)
@@ -217,6 +224,15 @@ class LocalKMS(KMSBase):
             "key_count": len(list(self._key_dir.glob("*.enc"))),
             "warning": "NOT FOR PRODUCTION",
         }
+
+    # Dans LocalKMS :
+
+    async def sign_evm_transaction(self, key_ref: KeyReference, tx_dict: dict) -> bytes:
+        private_bytes, _ = self._load_key(key_ref.key_id)
+        from eth_account import Account
+        acct = Account.from_key(private_bytes)
+        signed = acct.sign_transaction(tx_dict)
+        return signed.raw_transaction
 
 
 # ============================================================
@@ -377,7 +393,17 @@ class GCPKMS(KMSBase):
         except Exception as e:
             return {"provider": "gcp", "status": "unhealthy", "error": str(e)}
 
+    # Dans GCPKMS :
 
+    async def sign_evm_transaction(self, key_ref: KeyReference, tx_dict: dict) -> bytes:
+        private_bytes = await self._get_private_bytes(key_ref)
+        try:
+            from eth_account import Account
+            acct = Account.from_key(private_bytes)
+            signed = acct.sign_transaction(tx_dict)
+            return signed.raw_transaction
+        finally:
+            private_bytes = b"\x00" * len(private_bytes)
 # ============================================================
 # Fireblocks KMS Stub (Production Final)
 # ============================================================
@@ -414,7 +440,10 @@ class FireblocksKMS(KMSBase):
     async def health_check(self) -> Dict[str, Any]:
         return {"provider": "fireblocks", "status": "stub", "warning": "Not yet implemented"}
 
+    # Dans FireblocksKMS :
 
+    async def sign_evm_transaction(self, key_ref: KeyReference, tx_dict: dict) -> bytes:
+        raise NotImplementedError("Fireblocks KMS integration pending")
 # ============================================================
 # Factory
 # ============================================================
