@@ -557,4 +557,18 @@ async def approve_human_review(
         else:
             await conn.execute(
                 "UPDATE transactions SET status = 'policy_rejected' WHERE id = $1",
+                tx_id,
+            )
+
+            await audit.log(
+                "human_approval_denied",
+                actor,
+                org_id=org_id,
+                wallet_id=row["from_wallet_id"],
+                tx_id=tx_id,
+                ip_address=ip_address,
+                conn=conn,
+            )
+
+            return {"tx_id": str(tx_id), "status": "policy_rejected"}
            
