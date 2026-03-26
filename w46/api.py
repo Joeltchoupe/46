@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from w46 import services
@@ -368,10 +368,10 @@ def create_router() -> APIRouter:
         async with pool.acquire() as conn:
             return await generate_afid(conn, wallet_id)
 
-    @rep_router.post("/afid/verify")
+@rep_router.post("/afid/verify")
     async def route_verify_afid(
         wallet_id: UUID,
-        afid_document: Dict[str, Any],
+        afid_document: Dict[str, Any] = Body(...),
         auth: dict = Depends(require_auth),
     ):
         from w46.afid import verify_afid
