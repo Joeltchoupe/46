@@ -66,7 +66,7 @@ async def process_payment(
 ) -> Dict[str, Any]:
     """
     Full payment pipeline. This is the main entry point.
-    
+
     Returns the transaction record as a dict.
     """
     settings = get_settings()
@@ -81,11 +81,22 @@ async def process_payment(
             # ── Step 2: Idempotency Check ──────────────────
             if idempotency_key:
                 existing = await conn.fetchrow(
-                    "SELECT id, status, tx_hash FROM transactions WHERE idempotency_key = $1",
+                    """
+                    SELECT id, org_id, from_wallet_id, to_address, amount_usdc,
+                           fee_usdc, rail, status, tx_hash, proof_hash,
+                           memo, category, created_at, settled_at
+                    FROM transactions 
+                    WHERE idempotency_key = $1 AND org_id = $2
+                    """,
                     idempotency_key,
+                    org_id,
                 )
                 if existing:
-                    logger.info("settlement.idempotent_hit", idempotency_key=idempotency_key)
+                    logger.info(
+                        "settlement.idempotent_hit",
+                        idempotency_key=idempotency_key,
+                        tx_id=str(existing["id"]),
+                    )
                     return dict(existing)
 
             # ── Load Wallet ────────────────────────────────
@@ -111,15 +122,19 @@ async def process_payment(
                 raise WalletClosedError(details={"wallet_id": str(wallet_id)})
 
             # ── Check if destination is internal W46 wallet ─
+            # SECURITY: scoped to same org only — prevents cross-org internal routing
             to_wallet = await conn.fetchrow(
                 """
                 SELECT id, org_id, solana_address, base_address, status
                 FROM wallets
-                WHERE (solana_address = $1 OR base_address = $1 OR id::text = $1)
+                WHERE (solana_address = $1 OR base_address = $1)
+                  AND org_id = $2
                   AND status = 'active'
                 """,
                 to_address,
+                org_id,
             )
+
             to_wallet_id = to_wallet["id"] if to_wallet else None
             to_org_id = str(to_wallet["org_id"]) if to_wallet else None
 
@@ -142,12 +157,11 @@ async def process_payment(
 
             policy_result = evaluate(ctx, policy_snapshot)
 
-            # Insert TX record (status depends on policy result)
+            # ── Policy Rejected → Record and Stop ──────────
             if not policy_result.approved:
-                # Policy rejected — insert record and stop
                 await conn.execute(
                     """
-                    INSERT INTO transactions 
+                    INSERT INTO transactions
                         (id, org_id, from_wallet_id, to_address, to_wallet_id,
                          amount_usdc, status, policy_snapshot, policy_result,
                          memo, category, idempotency_key, metadata, created_at)
@@ -179,11 +193,11 @@ async def process_payment(
                     details={"tx_id": str(tx_id), "checks": policy_result.checks},
                 )
 
-            # ── Human Approval Check ──────────────────────
+            # ── Human Approval Required → Park and Wait ───
             if policy_result.requires_human_approval:
                 await conn.execute(
                     """
-                    INSERT INTO transactions 
+                    INSERT INTO transactions
                         (id, org_id, from_wallet_id, to_address, to_wallet_id,
                          amount_usdc, status, policy_snapshot, policy_result,
                          memo, category, idempotency_key, metadata, created_at)
@@ -226,11 +240,11 @@ async def process_payment(
                 preferred_rail=preferred_rail,
             )
 
-            # Check for ALL RAILS DOWN
+            # ── All Rails Down → Defer ─────────────────────
             if routing.estimated_time_sec < 0:
                 await conn.execute(
                     """
-                    INSERT INTO transactions 
+                    INSERT INTO transactions
                         (id, org_id, from_wallet_id, to_address, to_wallet_id,
                          amount_usdc, rail, status, policy_snapshot, policy_result,
                          memo, category, idempotency_key, metadata, created_at)
@@ -259,16 +273,28 @@ async def process_payment(
 
                 raise AllRailsDownError(details={"tx_id": str(tx_id)})
 
-            # Calculate fee
+            # ── Calculate Fee ──────────────────────────────
             fee_usdc = amount_usdc * routing.fee_per_usdc
 
-            # ── Step 6: Execute Transfer ───────────────────
-            # Insert TX as pending_settlement
+            # ── Ledger Balance Check (fast, pre-chain) ─────
+            total_debit = amount_usdc + fee_usdc
+            if wallet["balance_usdc"] < total_debit:
+                raise InsufficientBalanceError(
+                    message=f"Ledger balance {wallet['balance_usdc']} < {total_debit} USDC needed",
+                    details={
+                        "balance": str(wallet["balance_usdc"]),
+                        "amount": str(amount_usdc),
+                        "fee": str(fee_usdc),
+                        "total_needed": str(total_debit),
+                    },
+                )
+
+            # ── Step 6: Insert TX as Settling ──────────────
             await conn.execute(
                 """
-                INSERT INTO transactions 
+                INSERT INTO transactions
                     (id, org_id, from_wallet_id, to_address, to_wallet_id,
-                     amount_usdc, fee_usdc, rail, status, 
+                     amount_usdc, fee_usdc, rail, status,
                      policy_snapshot, policy_result,
                      memo, category, idempotency_key, metadata, created_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::tx_rail, 'settling'::tx_status,
@@ -283,6 +309,7 @@ async def process_payment(
                 now,
             )
 
+            # ── Execute Blockchain Transfer ────────────────
             try:
                 chain_result = await _execute_rail(
                     conn=conn,
@@ -294,13 +321,13 @@ async def process_payment(
                     org_id=org_id,
                 )
             except Exception as e:
-                # Settlement failed
+                # Settlement failed — mark and re-raise
                 record_rail_failure(routing.rail.value)
 
                 await conn.execute(
                     """
-                    UPDATE transactions 
-                    SET status = 'failed', error_message = $1 
+                    UPDATE transactions
+                    SET status = 'failed', error_message = $1
                     WHERE id = $2
                     """,
                     str(e)[:1000],
@@ -323,14 +350,14 @@ async def process_payment(
                     details={"tx_id": str(tx_id), "rail": routing.rail.value},
                 )
 
-            # ── Step 6b: Success ───────────────────────────
+            # ── Step 6b: Settlement Succeeded ──────────────
             record_rail_success(routing.rail.value)
             settled_at = datetime.now(timezone.utc)
 
             tx_hash = chain_result.get("tx_hash")
             block_number = chain_result.get("block_number") or chain_result.get("slot")
 
-            # ── Step 7: Attach Proof ───────────────────────
+            # ── Step 7: Attach Proof Hash ──────────────────
             proof_hash = await attach_proof(
                 conn=conn,
                 tx_id=tx_id,
@@ -344,22 +371,25 @@ async def process_payment(
                 settled_at=settled_at,
             )
 
-            # ── Step 8: Update Ledger ──────────────────────
+            # ── Step 8: Update Transaction Record ──────────
             await conn.execute(
                 """
                 UPDATE transactions
-                SET status = 'settled', tx_hash = $1, block_number = $2,
-                    settled_at = $3, proof_hash = $4
-                WHERE id = $5
+                SET status = 'settled',
+                    tx_hash = $1,
+                    block_number = $2,
+                    settled_at = $3
+                WHERE id = $4
                 """,
                 tx_hash,
                 block_number,
                 settled_at,
-                proof_hash,
                 tx_id,
             )
 
-            # Debit sender
+            # ── Step 8b: Update Ledger Balances ────────────
+
+            # Debit sender (amount + fee)
             await conn.execute(
                 """
                 UPDATE wallets
@@ -373,17 +403,32 @@ async def process_payment(
                 wallet_id,
             )
 
-            # Credit receiver (if internal)
+            # Credit receiver if internal transfer
             if to_wallet_id and routing.rail == TxRail.INTERNAL:
-                await conn.execute(
-                    """
-                    UPDATE wallets
-                    SET balance_usdc = balance_usdc + $1
-                    WHERE id = $2
-                    """,
-                    amount_usdc,
-                    to_wallet_id,
-                )
+                async with db.wallet_lock(conn, str(to_wallet_id)):
+                    await conn.execute(
+                        """
+                        UPDATE wallets
+                        SET balance_usdc = balance_usdc + $1
+                        WHERE id = $2
+                        """,
+                        amount_usdc,
+                        to_wallet_id,
+                    )
+
+                    # Attach proof on receiver side too for A2A
+                    await attach_proof(
+                        conn=conn,
+                        tx_id=tx_id,
+                        wallet_id=to_wallet_id,
+                        tx_hash=tx_hash,
+                        rail=routing.rail.value,
+                        amount_usdc=amount_usdc,
+                        fee_usdc=Decimal("0"),
+                        to_address=to_address,
+                        policy_snapshot=policy_snapshot.to_dict(),
+                        settled_at=settled_at,
+                    )
 
             # ── Step 9: Record Fee ─────────────────────────
             if fee_usdc > 0:
@@ -398,7 +443,7 @@ async def process_payment(
                     routing.rail.value,
                 )
 
-            # ── Step 10: Audit ─────────────────────────────
+            # ── Step 10: Audit Log ─────────────────────────
             await audit.log(
                 "tx_settled",
                 actor,
@@ -410,7 +455,11 @@ async def process_payment(
                     "fee_usdc": str(fee_usdc),
                     "rail": routing.rail.value,
                     "tx_hash": tx_hash,
+                    "block_number": block_number,
                     "proof_hash": proof_hash,
+                    "to_address": to_address,
+                    "to_wallet_id": str(to_wallet_id) if to_wallet_id else None,
+                    "routing": routing.to_dict(),
                 },
                 ip_address=ip_address,
                 conn=conn,
@@ -420,13 +469,23 @@ async def process_payment(
                 "settlement.complete",
                 tx_id=str(tx_id),
                 amount=str(amount_usdc),
+                fee=str(fee_usdc),
                 rail=routing.rail.value,
                 tx_hash=tx_hash,
             )
 
-            # Return final transaction record
+            # ── Return Final Transaction Record ────────────
             row = await conn.fetchrow(
-                "SELECT * FROM transactions WHERE id = $1",
+                """
+                SELECT id, org_id, from_wallet_id, to_address, to_wallet_id,
+                       amount_usdc, fee_usdc, rail, status, tx_hash,
+                       block_number, settled_at, proof_hash, prev_proof_hash,
+                       policy_snapshot, policy_result,
+                       memo, category, idempotency_key, metadata,
+                       error_message, created_at, updated_at
+                FROM transactions
+                WHERE id = $1
+                """,
                 tx_id,
             )
             return dict(row)
@@ -441,41 +500,88 @@ async def _execute_rail(
     routing: RoutingDecision,
     org_id: UUID,
 ) -> Dict[str, Any]:
-    """Execute the actual transfer based on the selected rail."""
+    """
+    Execute the actual transfer based on the selected rail.
 
+    Internal: ledger-only update, no blockchain involved.
+    Budget auth: no USDC moves, just reserve and issue token.
+    Solana/Base: real on-chain SPL/ERC-20 transfer via KMS signing.
+    """
+
+    # ── Internal Rail ──────────────────────────────────────
     if routing.rail == TxRail.INTERNAL:
-        # Internal: ledger-only, no blockchain
+        logger.info(
+            "settlement.internal_transfer",
+            from_wallet=str(wallet["id"]),
+            to_wallet=str(to_wallet["id"]) if to_wallet else None,
+            amount=str(amount_usdc),
+        )
         return {
             "tx_hash": f"internal_{uuid4().hex}",
             "confirmed": True,
             "chain": "internal",
         }
 
+    # ── Budget Authorization Rail ──────────────────────────
     if routing.rail == TxRail.BUDGET_AUTH:
-        # Budget auth: no USDC moves
+        budget_token = uuid4().hex
+        logger.info(
+            "settlement.budget_auth",
+            from_wallet=str(wallet["id"]),
+            budget_token=budget_token,
+            amount=str(amount_usdc),
+        )
+
+        # Store budget auth token on the transaction
+        await conn.execute(
+            """
+            UPDATE transactions
+            SET budget_auth_token = $1
+            WHERE id = (
+                SELECT id FROM transactions
+                WHERE from_wallet_id = $2
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            """,
+            budget_token,
+            wallet["id"],
+        )
+
         return {
-            "tx_hash": f"budget_{uuid4().hex}",
-            "budget_auth_token": uuid4().hex,
+            "tx_hash": f"budget_{budget_token}",
+            "budget_auth_token": budget_token,
             "confirmed": True,
             "chain": "budget_auth",
         }
 
-    # Blockchain rails
+    # ── Blockchain Rails (Solana / Base) ───────────────────
+
     chain_client = get_chain_client(routing.rail)
 
+    # Select the right address and key ref for the chosen rail
     if routing.rail == TxRail.SOLANA:
         from_address = wallet["solana_address"]
         key_ref_data = wallet["solana_key_ref"]
-    else:  # BASE
+    elif routing.rail == TxRail.BASE:
         from_address = wallet["base_address"]
         key_ref_data = wallet["base_key_ref"]
+    else:
+        raise SettlementError(f"Unknown blockchain rail: {routing.rail.value}")
 
-    if not from_address or not key_ref_data:
+    if not from_address:
         raise SettlementError(
-            f"Wallet missing {routing.rail.value} address or key reference"
+            f"Wallet {wallet['id']} has no {routing.rail.value} address",
+            details={"wallet_id": str(wallet["id"]), "rail": routing.rail.value},
         )
 
-    # Reconstruct KeyReference from stored data
+    if not key_ref_data:
+        raise SettlementError(
+            f"Wallet {wallet['id']} has no {routing.rail.value} key reference",
+            details={"wallet_id": str(wallet["id"]), "rail": routing.rail.value},
+        )
+
+    # Reconstruct KeyReference from stored JSON
     key_ref_meta = json.loads(key_ref_data) if isinstance(key_ref_data, str) else key_ref_data
     key_ref = KeyReference(
         key_id=key_ref_meta.get("key_id", ""),
@@ -483,24 +589,52 @@ async def _execute_rail(
         metadata=key_ref_meta,
     )
 
-    # Verify on-chain balance before sending
-    on_chain_balance = await chain_client.get_usdc_balance(from_address)
+    # ── Verify On-Chain Balance Before Sending ─────────────
+    # This is the SOURCE OF TRUTH check — ledger is just a mirror
+    try:
+        on_chain_balance = await chain_client.get_usdc_balance(from_address)
+    except Exception as e:
+        raise SettlementError(
+            f"Failed to check on-chain balance on {routing.rail.value}: {e}",
+            details={"address": from_address, "rail": routing.rail.value},
+        )
+
     if on_chain_balance < amount_usdc:
         raise InsufficientBalanceError(
-            message=f"On-chain balance {on_chain_balance} < {amount_usdc} USDC",
+            message=(
+                f"On-chain balance {on_chain_balance} USDC "
+                f"< {amount_usdc} USDC required on {routing.rail.value}"
+            ),
             details={
                 "on_chain_balance": str(on_chain_balance),
                 "requested": str(amount_usdc),
                 "chain": routing.rail.value,
+                "address": from_address,
             },
         )
 
-    # Execute transfer
+    logger.info(
+        "settlement.executing_transfer",
+        rail=routing.rail.value,
+        from_address=from_address,
+        to_address=to_address,
+        amount=str(amount_usdc),
+        on_chain_balance=str(on_chain_balance),
+    )
+
+   # ── Execute The Actual Blockchain Transfer ─────────────
     result = await chain_client.transfer_usdc(
         from_key_ref=key_ref,
         from_address=from_address,
         to_address=to_address,
         amount_usdc=amount_usdc,
+    )
+
+    logger.info(
+        "settlement.transfer_confirmed",
+        rail=routing.rail.value,
+        tx_hash=result.get("tx_hash"),
+        block=result.get("block_number") or result.get("slot"),
     )
 
     return result
@@ -515,13 +649,19 @@ async def approve_human_review(
 ) -> Dict[str, Any]:
     """
     Approve or deny a transaction that requires human approval.
-    If approved, resumes the settlement pipeline.
+
+    If approved, resumes the full settlement pipeline from scratch
+    (re-evaluates policy, re-checks balance, re-selects rail).
+
+    If denied, marks as policy_rejected permanently.
     """
     pool = db.get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT * FROM transactions
+            SELECT id, org_id, from_wallet_id, to_address, amount_usdc,
+                   memo, category, metadata
+            FROM transactions
             WHERE id = $1 AND org_id = $2 AND status = 'pending_policy'
             """,
             tx_id,
@@ -529,7 +669,9 @@ async def approve_human_review(
         )
 
         if not row:
-            raise ValueError(f"Transaction {tx_id} not found or not pending approval")
+            raise ValueError(
+                f"Transaction {tx_id} not found, not owned by org, or not pending approval"
+            )
 
         if approved:
             await audit.log(
@@ -538,11 +680,25 @@ async def approve_human_review(
                 org_id=org_id,
                 wallet_id=row["from_wallet_id"],
                 tx_id=tx_id,
+                details={"amount": str(row["amount_usdc"])},
                 ip_address=ip_address,
                 conn=conn,
             )
 
-            # Re-run the settlement pipeline
+    # Mark old tx as superseded
+            await conn.execute(
+                """
+                UPDATE transactions
+                SET status = 'policy_approved',
+                    error_message = 'Human approved — re-processing'
+                WHERE id = $1
+                """,
+                tx_id,
+            )
+
+            # Re-run the full pipeline with a fresh transaction
+            # This ensures current balance, policy, and rail state are used
+            tx_metadata = json.loads(row["metadata"]) if row["metadata"] else None
             return await process_payment(
                 org_id=org_id,
                 wallet_id=row["from_wallet_id"],
@@ -550,13 +706,18 @@ async def approve_human_review(
                 amount_usdc=row["amount_usdc"],
                 memo=row["memo"],
                 category=row["category"],
-                metadata=json.loads(row["metadata"]) if row["metadata"] else None,
+                metadata=tx_metadata,
                 actor=actor,
                 ip_address=ip_address,
-            )
+                )
         else:
             await conn.execute(
-                "UPDATE transactions SET status = 'policy_rejected' WHERE id = $1",
+                """
+                UPDATE transactions
+                SET status = 'policy_rejected',
+                    error_message = 'Human review denied'
+                WHERE id = $1
+                """,
                 tx_id,
             )
 
@@ -566,9 +727,13 @@ async def approve_human_review(
                 org_id=org_id,
                 wallet_id=row["from_wallet_id"],
                 tx_id=tx_id,
+                details={"amount": str(row["amount_usdc"])},
                 ip_address=ip_address,
                 conn=conn,
             )
 
-            return {"tx_id": str(tx_id), "status": "policy_rejected"}
-           
+           return {
+                "tx_id": str(tx_id),
+                "status": "policy_rejected",
+                "message": "Transaction denied by human reviewer",
+           }
