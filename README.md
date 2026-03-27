@@ -159,7 +159,103 @@ POST   /v1/wallets/:id/payments   Execute payment
 GET    /v1/wallets/:id/payments   List wallet payments
 ```
 Transactions
-text
 
+```text
 GET    /v1/transactions           List all transactions
-GET    /v1/transactions/:id       Get
+GET    /v1/transactions/:id       Get transaction details
+POST   /v1/transactions/:id/approve  Approve/deny human review
+```
+
+### Policy
+
+```text
+GET    /v1/wallets/:id/policy     Get active policy
+PUT    /v1/wallets/:id/policy     Update policy
+```
+
+### Proof & Integrity
+
+```text
+GET    /v1/proof/wallets/:id/verify  Verify proof chain
+GET    /v1/proof/audit/verify        Verify audit chain
+GET    /v1/proof/anchors             List anchor batches
+```
+### Reputation & AFID
+
+```text
+GET    /v1/wallets/:id/reputation    Get trust score
+GET    /v1/wallets/:id/afid          Get AFID document
+POST   /v1/wallets/:id/afid/verify   Verify AFID
+```
+
+### Admin
+
+```text
+POST   /v1/admin/reconcile          Reconcile all wallets
+POST   /v1/admin/reconcile/:id      Reconcile specific wallet
+GET    /v1/admin/fees                Get pending fees
+POST   /v1/admin/fees/sweep          Sweep fees to operator
+GET    /v1/admin/circuit-breakers    Circuit breaker states
+```
+
+## Deployment
+
+### Quick Start (Development)
+
+```bash
+git clone https://github.com/yourorg/w46.git
+cd w46
+cp .env.example .env
+# Edit .env with your values
+docker-compose up --build
+# API available at http://localhost:8046
+# Docs at http://localhost:8046/docs
+```
+### Production
+
+```bash
+# 1. Set up GCP KMS keyring
+gcloud kms keyrings create w46-prod --location=europe-west1
+gcloud kms keys create master-key --keyring=w46-prod \
+  --location=europe-west1 --purpose=encryption
+
+# 2. Configure .env for production
+W46_ENV=production
+W46_KMS_PROVIDER=gcp
+W46_GCP_PROJECT_ID=your-project
+W46_GCP_LOCATION=europe-west1
+W46_GCP_KEYRING=w46-prod
+W46_GCP_KEY_ID=master-key
+W46_OPERATOR_SOLANA_ADDRESS=your_solana_wallet
+W46_OPERATOR_BASE_ADDRESS=0xyour_base_wallet
+
+# 3. Deploy
+docker-compose -f docker-compose.yml up -d
+```
+
+## Fee Structure
+
+
+| Rail | Speed | Fee | Best For |
+|---|---|---|---|
+| Solana | < 1 second | $0.005 / USDC | Micro-payments ≤ $50 |
+| Base | ~2 seconds | $0.05 / USDC | Large settlements ≥ $500 |
+| Internal | Instant | Free | Same-org wallet transfers |
+
+Fees are collected per USDC transferred, *not per transaction*. Swept to operator wallets hourly.
+
+## Security Model
+
+Private keys: Never in application code. KMS-managed (GCP HSM or Fireblocks MPC).
+
+Advisory locks: PostgreSQL per-wallet locks prevent race conditions.
+
+Policy-first: Rejected transactions never touch the blockchain.
+
+Proof chain: Cryptographic hash chain per wallet, Merkle-anchored on-chain.
+
+Audit log: Immutable (PostgreSQL triggers block UPDATE/DELETE), hash-chained.
+
+Reconciliation: Periodic ledger-vs-blockchain comparison with alerts.
+
+Circuit breakers: Automatic failover between chains.
